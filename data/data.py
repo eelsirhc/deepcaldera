@@ -7,7 +7,9 @@ import cv2
 from tqdm import tqdm, tqdm_notebook
 from sklearn.preprocessing import MinMaxScaler
 import deepmars2.config as cfg
+from scipy.interpolate import RectBivariateSpline
 
+interpolator = None
 
 def get_DEM(filename, is_Mars):
     """Reads the DEM from a large tiff file.
@@ -129,12 +131,79 @@ def fill_ortho_grid(lat_0, lon_0, box_size, img, dim=256):
             (platecarree_coords[0, :, :] - 180) * (img.shape[1] / 360), #CL This forces a negative index, which is weird.
         ]
     )
-    
+    # print(img.shape, lat_0, lon_0, box_size, dim)
+    # print(pixel_coords.shape)
+    # o=[0,0]
+    # for i in range(256):
+    #     for j in range(256):
+    #         if not ((pixel_coords[0,i,j]==o[0]) and (pixel_coords[1,i,j]==o[1])):
+    #             print(i,j,pixel_coords[:,i,j])
+    #             o=pixel_coords[:,i,j]
+
     pixel_coords = pixel_coords.astype(int)
     ortho = img[pixel_coords[0], pixel_coords[1]]
 #    print(lon_0, lat_0, box_size)
 #    print(pixel_coords[1].min(), pixel_coords[1].max(),pixel_coords[0].min(),pixel_coords[0].max())
     
+    return ortho
+
+def fill_grid(lat_0, lon_0, box_size, img, dim=256):
+    """Creates an scaled image
+
+    Paramters
+    ---------
+    lat_0 : float
+        Central latitude of the image.
+    lon_0 : float
+        Central longitude of the image.
+    box_size : float
+        An abstract quantity measuring the size of the region being projected.
+        It is proportional to the absolute size of the box in km but scaled so
+        that at the equator, a box of size 1 denotes a box 1 degree across.
+    img : numpy.ndarray
+        The original image in plate carree coordinates to project from.
+    dim : int, optional
+        The width/height of the output image.  Only square outputs are
+        supported.
+    
+    Returns
+    -------
+    ortho : numpy.ndarray
+        The orthographic projection.
+    """
+    
+    deg_per_pix = box_size / dim
+    orthographic_coords = (np.indices((dim, dim)) - dim / 2).astype(int)
+    
+#    
+#    platecarree_coords = np.asarray(
+#        transformer.transform(orthographic_coords[0], orthographic_coords[1])
+#    )
+#
+#    pixel_coords = np.asarray(
+#        [
+#            (90 - platecarree_coords[1, :, :]) * (img.shape[0] / 180),
+#            (platecarree_coords[0, :, :] - 180) * (img.shape[1] / 360), #CL This forces a negative index, which is weird.
+#        ]
+#    )
+#    
+#    pixel_coords = pixel_coords.astype(int)
+#    ortho = img[pixel_coords[0], pixel_coords[1]]
+#    print(lon_0, lat_0, box_size)
+#    print(orthographic_coords)
+    global interpolator
+    if interpolator is None:
+        interpolator = RectBivariateSpline(np.arange(img.shape[0]),np.arange(img.shape[1]),img)
+    ortho = interpolator(np.linspace(lat_0-box_size/2,lat_0+box_size/2,dim), np.linspace(lon_0-box_size/2,lon_0+box_size/2,dim))
+    mask = np.meshgrid(np.linspace(lat_0-box_size/2,lat_0+box_size/2,dim), np.linspace(lon_0-box_size/2,lon_0+box_size/2,dim))
+    mask = (mask[0]<0)|(mask[0]>img.shape[0])|(mask[1]<0)|(mask[1]>img.shape[1])
+    ortho[mask.T]=0
+
+#    source = img[int(lat_0-box_size//2):int(lat_0-box_size//2),int(lon_0-box_size//2):int(lon_0-box_size//2)]
+#    ortho = RectBivariateSpline(np.arange(source.shape[0]),np.arange(source.shape[1]),source)(np.linspace(0,source.shape[0],dim),
+#                                                                                           np.linspace(0,source.shape[1],dim))
+#    print(pixel_coords[1].min(), pixel_coords[1].max(),pixel_coords[0].min(),pixel_coords[0].max())
+#    print(ortho.shape)
     return ortho
 
 
@@ -290,7 +359,7 @@ def normalize(array):
     return normalized
 
 
-def get_craters_in_img(craters, lat_0, lon_0, box_size, dim=256):
+def get_craters_in_img(craters, lat_0, lon_0, box_size, dim=256,project=True):
     """Return a list of the craters in an image.
     
     Parameters
@@ -331,13 +400,16 @@ def get_craters_in_img(craters, lat_0, lon_0, box_size, dim=256):
     # Do nothing for empty crater list
     if len(craters_in_img_approx) == 0:
         return craters_in_img_approx
-    
-    # Convert from Lat/Long/km to pixels
-    x, y, d = lld_to_xyd(craters_in_img_approx['Lat'].values.copy(),
+    if project:
+        # Convert from Lat/Long/km to pixels
+        x, y, d = lld_to_xyd(craters_in_img_approx['Lat'].values.copy(),
                          craters_in_img_approx['Long'].values.copy(),
                          craters_in_img_approx['Diameter (km)'].values.copy(),
                          lat_0, lon_0, box_size)
-    
+    else:
+        x,y,d = (craters_in_img_approx['Lat'].values.copy(),
+                 craters_in_img_approx['Long'].values.copy(),
+                 craters_in_img_approx['Diameter (km)'].values.copy())
     craters_in_img_approx['x (pix)'] = x
     craters_in_img_approx['y (pix)'] = y
     craters_in_img_approx['Diameter (pix)'] = d
@@ -476,7 +548,7 @@ def lld_to_xyd(lat, lon, d, lat_0, lon_0, box_size, dim=256, return_ints=True):
         return x, y, d
 
 
-def get_approx_width(box_size, lat):
+def get_approx_width(box_size, lat,project=True):
     """Get the approximate width of a box at a given latitude and box size.
     
     Parameters
@@ -493,23 +565,23 @@ def get_approx_width(box_size, lat):
     min_width : float
         The approximate minimum width of the box.
     """
-    
-    min_width = box_size / np.cos(np.deg2rad(lat))
-    
+    if project:
+        min_width = box_size / np.cos(np.deg2rad(lat))
+    else:
+        min_width = box_size
     return min_width
 
 
-def systematic_pass(box_sizes, min_lat=-90, max_lat=90, min_long=-180, max_long=180):
+def systematic_pass(box_sizes, min_lat=-90, max_lat=90, min_long=-180, max_long=180,project=True):
     coords = []
-    
     for box_size in box_sizes:
+       # print(box_size)
         box_size = box_size / 2 # for overlap
         n_lats = int(np.ceil((max_lat - min_lat) / box_size))
         lats = np.linspace(min_lat, max_lat, n_lats + 1)
         lats = lats[:-1] + np.diff(lats) / 2
-        
         for lat in lats:
-            width = get_approx_width(box_size, lat)
+            width = get_approx_width(box_size, lat,project=project)
             n_lons = int(np.ceil((max_long - min_long) / width))
             lons = np.linspace(min_long, max_long, n_lons + 1)
             lons = lons[:-1] + np.diff(lons) / 2
@@ -522,20 +594,28 @@ def systematic_pass(box_sizes, min_lat=-90, max_lat=90, min_long=-180, max_long=
     return np.array(coords)
             
 
-def make_images(craters, lat, lon, box_size, dim, DEM, IR, ring_size):
-    craters_in_img = get_craters_in_img(craters, lat, lon, box_size, dim=dim)
+def make_images(craters, lat, lon, box_size, dim, DEM, IR, ring_size, project=True):
+    craters_in_img = get_craters_in_img(craters, lat, lon, box_size, dim=dim,project=project)
     
     ortho_mask = make_mask(craters_in_img, ring_size, dim=dim)
     ortho_mask = normalize(ortho_mask)
-
-    ortho_IR = fill_ortho_grid(lat, lon, box_size, IR)
-    ortho_IR = normalize(ortho_IR)
+    if IR is not None:
+        if project:
+            ortho_IR = fill_ortho_grid(lat, lon, box_size, IR)
+        else:
+            ortho_IR = fill_grid(lat, lon, box_size, IR)
+        ortho_IR = normalize(ortho_IR)
+    else:
+        ortho_IR = None
     
     if DEM is not None:
-        ortho_DEM = fill_ortho_grid(lat, lon, box_size, DEM)
+        if project:
+            ortho_DEM = fill_ortho_grid(lat, lon, box_size, DEM)
+        else:
+            ortho_DEM = fill_grid(lat, lon, box_size, DEM)
         ortho_DEM = normalize(ortho_DEM)
     else:
-        ortho_DEM = ortho_IR*0
+        ortho_DEM = None
 
     return ortho_DEM, ortho_IR, ortho_mask, craters_in_img
         
@@ -558,7 +638,8 @@ def gen_dataset(
     min_lat=-90,
     max_lat=90,
     min_long=-180,
-    max_long=180
+    max_long=180,
+    project=True
 ):
     
     # Create HDF5 files
@@ -617,15 +698,18 @@ def gen_dataset(
         
         else:
             raise ValueError('Mode must be either random or systematic')
-#        print(lat, lon, box_size)
+        #print(lat, lon, box_size)
         ortho_DEM, ortho_IR, ortho_mask, craters_xy = make_images(craters, lat,
                                                                   lon,
                                                                   box_size,
                                                                   dim, DEM, IR,
-                                                                  ring_size)
+                                                                  ring_size,
+                                                                  project=project)
 
-        imgs_h5_DEM[i, ...] = ortho_DEM
-        imgs_h5_IR[i, ...] = ortho_IR
+        if DEM is not None:
+            imgs_h5_DEM[i, ...] = ortho_DEM
+        if IR is not None:
+            imgs_h5_IR[i, ...] = ortho_IR
         imgs_h5_targets[i, ...] = ortho_mask
         imgs_h5_cll[i, 0] = lat
         imgs_h5_cll[i, 1] = lon

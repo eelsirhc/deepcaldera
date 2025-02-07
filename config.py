@@ -6,22 +6,21 @@ rad_thresh_ = 0.25
 template_thresh_ = 0.475
 target_thresh_ = 0.3
 
-root_dir = "/disks/work/lee/dm2/craters"
-DEM_filename = root_dir + "/data/raw/Mars_HRSC_MOLA_BlendDEM_Global_200mp_v2.tif"
-IR_filename = root_dir + "/data/raw/Mars_THEMIS_scaled.tif"
-crater_filename = root_dir + "/data/raw/RobbinsCraters_20121016.tsv"
-
+root_dir = "/mnt/export/lee/1-Projects/deepcaldera"
+#DEM_filename = root_dir + "/data/raw/Mars_HRSC_MOLA_BlendDEM_Global_200mp_v2.tif"
+#IR_filename = root_dir + "/data/raw/Mars_THEMIS_scaled.tif"
+#crater_filename = root_dir + "/data/raw/RobbinsCraters_20121016.tsv"
 # Mars
-R_planet = 3389.5
+R_planet = 6378
 
 # Moon
 #R_planet = 1737.1
 
 # Best pre-trained models
 # Mars Robbins Trained
-mars_DEM_model = root_dir + '/data/ResUNET/models/james_best/mars_DEM_139_0.59.hdf5'
-mars_IR_model = root_dir + '/data/ResUNET/models/james_best/mars_IR_78_0.65.hdf5'
-mars_post_processing_model = root_dir + '/data/post_processing_net/models/james_best/mars_post_61_0.899.hdf5'
+DEM_model = root_dir + '/data/ResUNET/models/james_best/dem.hdf5'#mars_DEM_139_0.59.hdf5'
+IR_model = root_dir + '/data/ResUNET/models/james_best/mars_IR_78_0.65.hdf5'
+post_processing_model = root_dir + '/data/post_processing_net/models/james_best/mars_post_61_0.899.hdf5'
 
 # Moon H&P Trained on 118/100m/pix
 #moon_DEM_model = root_dir + '/ResUNET/models/Fri Jul 19 12:20:22 2019/51-0.60.hdf5'

@@ -40,7 +40,7 @@ def load_model(model=None):
 
 
 def get_model_preds(CP):
-    """Reads 6in or generates model predictions.
+    """Reads sin or generates model predictions.
 
     Parameters
     ----------
@@ -395,10 +395,10 @@ def cnn_prediction(index, prefix, output_prefix, model, dataset):
         if dataset == 'IR':
             #model = os.path.join(cfg.root_dir, './ResUNET/models/Thu Jun 27 14:04:17 2019/78-0.65.hdf5')
             #model = os.path.join(cfg.root_dir, '/disks/work/james/deepmars2/ResUNET/models/Fri Jul 12 09:59:22 2019/64-0.68.hdf5')
-            model = cfg.moon_IR_model
+            model = cfg.IR_model
         elif dataset == 'DEM':
             #model = os.path.join(cfg.root_dir, './ResUNET/models/Tue Jun 18 17:26:59 2019/139-0.59.hdf5')
-            model = cfg.moon_DEM_model
+            model = cfg.DEM_model
         else:
             raise ValueError('dataset must be one of DEM or IR')
     
