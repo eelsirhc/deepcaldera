@@ -7,7 +7,7 @@ import cv2
 from tqdm import tqdm, tqdm_notebook
 from sklearn.preprocessing import MinMaxScaler
 import deepmars2.config as cfg
-from scipy.interpolate import RectBivariateSpline
+from scipy.interpolate import RectBivariateSpline, griddata
 
 interpolator = None
 
@@ -80,8 +80,83 @@ def get_craters(filename):
 
     return craters
 
+from rasterio.transform import from_bounds
+from rasterio.warp import reproject, Resampling
+from rasterio.windows import Window
+from pyproj import Transformer
+from rasterio.windows import Window, transform as window_transform
+from rasterio.transform import rowcol
 
-def fill_ortho_grid(lat_0, lon_0, box_size, img, dim=256):
+def fast_reproject(lat_0, lon_0, box_size, img, src, dim=256):
+    # Define coordinate systems
+    mercator = "EPSG:3395"
+    latlong = "EPSG:4326"
+    orthographic = dict(proj="ortho", lat_0=lat_0, lon_0=lon_0)
+
+    # Use pyproj for faster coordinate transforms
+    transformer = Transformer.from_crs(latlong, orthographic, always_xy=True)
+    coords = [
+        (lon_0, lat_0),
+        (lon_0, lat_0 + box_size / 2),
+        (lon_0, lat_0 - box_size / 2)
+    ]
+    nxs, nys = transformer.transform(*zip(*coords))
+    centre = (nxs[0], nys[0])
+    top = (nxs[1], nys[1])
+    bottom = (nxs[2], nys[2])
+    width = top[1] - bottom[1]
+
+    # Define output bounds and transform
+    new_left, new_bottom = centre[0] - width / 2, bottom[1]
+    new_right, new_top = centre[0] + width / 2, top[1]
+
+    # Reproject destination bounds from ORTHO to EPSG:3395 (source CRS)
+    ortho_to_merc = Transformer.from_crs(orthographic, "EPSG:3395", always_xy=True)
+    src_bounds = ortho_to_merc.transform_bounds(new_left, new_bottom, new_right, new_top, densify_pts=10)
+    
+    # Get pixel bounds in source image
+    row_start, col_start = rowcol(src.transform, src_bounds[0], src_bounds[3])  # top-left
+    row_stop, col_stop = rowcol(src.transform, src_bounds[2], src_bounds[1])   # bottom-right
+    
+    # Make sure indices are valid
+    row_start, row_stop = sorted((max(0, row_start), min(img.shape[0], row_stop)))
+    col_start, col_stop = sorted((max(0, col_start), min(img.shape[1], col_stop)))
+    
+    # Crop the image more accurately
+    d = img[row_start:row_stop, col_start:col_stop]
+    window = Window(col_start, row_start, col_stop - col_start, row_stop - row_start)
+    src_transform_cropped = window_transform(window, src.transform)
+
+    dst_transform = from_bounds(new_left, new_bottom, new_right, new_top, dim, dim)
+
+    # Reproject
+    dst_data = np.empty((dim, dim), dtype=img.dtype)
+
+    try:
+        reproject(
+            source=d,
+            destination=dst_data,
+            src_transform=src_transform_cropped,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=orthographic,
+            resampling=Resampling.nearest
+        )
+    except:
+        reproject(
+            source=img,
+            destination=dst_data,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=orthographic,
+            resampling=Resampling.nearest
+        )
+
+
+    return dst_data, True
+
+def fill_ortho_grid(lat_0, lon_0, box_size, img, src, dim=256):
     """Creates an orthographic projection from a plate caree projection.
 
     Paramters
@@ -105,47 +180,118 @@ def fill_ortho_grid(lat_0, lon_0, box_size, img, dim=256):
     ortho : numpy.ndarray
         The orthographic projection.
     """
-    
-    deg_per_pix = box_size / dim
-    orthographic_coords = (np.indices((dim, dim)) - dim / 2) * deg_per_pix
-    
-    pipeline_str = (
-        'proj=pipeline '
-        'step proj=unitconvert xy_in=deg xy_out=rad '
-        'step proj=eqc '
-        'step proj=ortho inv lat_0={} lon_0={} '
-        'step proj=unitconvert xy_in=rad xy_out=deg'
-    ).format(lat_0, lon_0)
-    
-    transformer = Transformer.from_pipeline(pipeline_str)
-    
-    
-    
-    platecarree_coords = np.asarray(
-        transformer.transform(orthographic_coords[0], orthographic_coords[1])
-    )
+#    print("PROJECT: ", lon_0, lat_0, box_size)
+#    def fog2(lat_0, lon_0, box_size, src, src_data, dim=256):
+    from rasterio.transform import from_bounds
+    from rasterio.warp import reproject, Resampling
+    import fiona.transform
+    #convert from lat long to mercator in meters?
+    coords = [[lon_0, lat_0]]
 
-    pixel_coords = np.asarray(
-        [
-            (90 - platecarree_coords[1, :, :]) * (img.shape[0] / 180),
-            (platecarree_coords[0, :, :] - 180) * (img.shape[1] / 360), #CL This forces a negative index, which is weird.
-        ]
-    )
-    # print(img.shape, lat_0, lon_0, box_size, dim)
-    # print(pixel_coords.shape)
-    # o=[0,0]
-    # for i in range(256):
-    #     for j in range(256):
-    #         if not ((pixel_coords[0,i,j]==o[0]) and (pixel_coords[1,i,j]==o[1])):
-    #             print(i,j,pixel_coords[:,i,j])
-    #             o=pixel_coords[:,i,j]
-
-    pixel_coords = pixel_coords.astype(int)
-    ortho = img[pixel_coords[0], pixel_coords[1]]
-#    print(lon_0, lat_0, box_size)
-#    print(pixel_coords[1].min(), pixel_coords[1].max(),pixel_coords[0].min(),pixel_coords[0].max())
+    #short circuit for missing data
+    ny,nx = img.shape
+    cx,cy = lon_0, lat_0
     
-    return ortho
+    approx_lat_pix = (ny/180)*(cy+90)
+    approx_lon_pix = (nx/360)*(cx+180)
+    bs_pix = box_size * nx/360
+
+    sx = slice(int(approx_lon_pix-bs_pix), int(approx_lon_pix+bs_pix))
+    sy = slice(int(approx_lat_pix-bs_pix), int(approx_lat_pix+bs_pix))
+    if sx.start < 0 or sx.stop > nx or sy.start < 0 or sy.stop > ny:
+        return np.zeros((dim,dim)), False
+    
+    d = img[sy,sx]
+    if d.max()==d.min():
+        return np.zeros((dim,dim)), False
+    #
+    
+    mercator = "EPSG:3395" 
+    latlong = "EPSG:4326"
+    orthographic = dict(proj="ortho", lat_0=lat_0,lon_0=lon_0)
+    
+
+    def reproject_coords(src_crs, dst_crs, coords):
+        xs = [c[0] for c in coords]
+        ys = [c[1] for c in coords]
+        nxs, nys = fiona.transform.transform(src_crs, dst_crs, xs, ys)
+        return [[x,y] for x,y in zip(nxs, nys)]
+
+    
+    #get the box limits in lat,lon to ortho
+    centre = reproject_coords(latlong, orthographic, [[lon_0, lat_0]])[0]
+    top = reproject_coords(latlong, orthographic, [[lon_0, lat_0+box_size/2]])[0]
+    bottom = reproject_coords(latlong, orthographic, [[lon_0, lat_0-box_size/2]])[0]
+    width = top[1]-bottom[1]
+
+    
+    # Example: desired destination bounds in the destination CRS:
+    new_left, new_bottom, new_right, new_top = centre[0]-width/2, bottom[1], centre[0]+width/2, top[1]
+    
+    # And suppose you want an output raster of width x height pixels:
+    dst_width, dst_height = dim,dim
+
+    # Create the affine transform for the destination raster:
+    dst_transform = from_bounds(new_left, new_bottom, new_right, new_top, dst_width, dst_height)
+    src_transform = src.transform
+    src_crs = src.crs
+    
+
+    # Prepare an empty array for the destination data
+    dst_data = np.empty((dst_height, dst_width), dtype=img.dtype)
+    dst_crs = orthographic
+    # # Reproject the data:
+    pp = reproject(
+        source=img,
+        destination=dst_data,
+        src_transform=src_transform,
+        src_crs=src_crs,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        resampling=Resampling.nearest  # or another resampling method as needed
+    )
+    return pp[0], True
+
+#    deg_per_pix = box_size / dim
+#    orthographic_coords = (np.indices((dim, dim)) - dim / 2) * deg_per_pix
+#    
+#    pipeline_str = (
+#        'proj=pipeline '
+#        'step proj=unitconvert xy_in=deg xy_out=rad '
+#        'step proj=eqc '
+#        'step proj=ortho inv lat_0={} lon_0={} '
+#        'step proj=unitconvert xy_in=rad xy_out=deg'
+#    ).format(lat_0, lon_0)
+#    
+#    transformer = Transformer.from_pipeline(pipeline_str)
+#    
+#    
+#    
+#    platecarree_coords = np.asarray(
+#        transformer.transform(orthographic_coords[0], orthographic_coords[1])
+#    )
+#
+#    pixel_coords = np.asarray(
+#        [
+#            (90 - platecarree_coords[1, :, :]) * (img.shape[0] / 180),
+#            (platecarree_coords[0, :, :] - 180) * (img.shape[1] / 360), #CL This forces a negative index, which is weird.
+#        ]
+#    )
+#    # print(img.shape, lat_0, lon_0, box_size, dim)
+#    # print(pixel_coords.shape)
+#    # o=[0,0]
+#    # for i in range(256):
+#    #     for j in range(256):
+#    #         if not ((pixel_coords[0,i,j]==o[0]) and (pixel_coords[1,i,j]==o[1])):
+#    #             print(i,j,pixel_coords[:,i,j])
+#    #             o=pixel_coords[:,i,j]
+#
+#    pixel_coords = pixel_coords.astype(int)
+#    ortho = img[pixel_coords[0], pixel_coords[1]]
+##    print(lon_0, lat_0, box_size)
+##    print(pixel_coords[1].min(), pixel_coords[1].max(),pixel_coords[0].min(),pixel_coords[0].max())
+#    
+#    return ortho
 
 def fill_grid(lat_0, lon_0, box_size, img, dim=256):
     """Creates an scaled image
@@ -334,6 +480,21 @@ def make_mask(craters, ring_size, dim=256):
 
     return mask
 
+def remove_missing_data(array,limit=8192):
+    array[array>limit]=np.nan
+    array = np.ma.masked_invalid(array)
+    x=np.arange(array.shape[0])
+    y=np.arange(array.shape[1])
+    xx, yy = np.meshgrid(x, y)
+    #get only the valid values
+    x1 = xx[~array.mask]
+    y1 = yy[~array.mask]
+    newarr = array[~array.mask]
+
+    GD1 = griddata((x1, y1), newarr.ravel(),
+                   (xx, yy),
+                   method='nearest')
+    return GD1
 
 def normalize(array):
     """Normalize an array to have values between 0 and 1.
@@ -348,7 +509,13 @@ def normalize(array):
     normalized : numpy.ndarray
         The normalized array.
     """
-    
+
+    #remove missing data
+    try:
+        newarray = remove_missing_data(array,limit=8192)
+    except ValueError:
+        newarray = array
+    array = newarray
     
     shape = array.shape
     array = array.astype(np.float64)
@@ -594,14 +761,14 @@ def systematic_pass(box_sizes, min_lat=-90, max_lat=90, min_long=-180, max_long=
     return np.array(coords)
             
 
-def make_images(craters, lat, lon, box_size, dim, DEM, IR, ring_size, project=True):
+def make_images(craters, lat, lon, box_size, dim, DEM, DEM_src, IR, IR_src, ring_size, project=True):
     craters_in_img = get_craters_in_img(craters, lat, lon, box_size, dim=dim,project=project)
     
     ortho_mask = make_mask(craters_in_img, ring_size, dim=dim)
     ortho_mask = normalize(ortho_mask)
     if IR is not None:
         if project:
-            ortho_IR = fill_ortho_grid(lat, lon, box_size, IR)
+            ortho_IR = fill_ortho_grid(lat, lon, box_size, IR, IR_src)
         else:
             ortho_IR = fill_grid(lat, lon, box_size, IR)
         ortho_IR = normalize(ortho_IR)
@@ -609,11 +776,19 @@ def make_images(craters, lat, lon, box_size, dim, DEM, IR, ring_size, project=Tr
         ortho_IR = None
     
     if DEM is not None:
+        do_normalize=True
         if project:
-            ortho_DEM = fill_ortho_grid(lat, lon, box_size, DEM)
+            try:
+                ortho_DEM,_do_normalize = fast_reproject(lat, lon, box_size, DEM, DEM_src) #
+            except:
+                raise
+#            ortho_DEM, _do_normalize = fill_ortho_grid(lat, lon, box_size, DEM, DEM_src)
+#            import sys
+#            sys.exit(0)
         else:
             ortho_DEM = fill_grid(lat, lon, box_size, DEM)
-        ortho_DEM = normalize(ortho_DEM)
+        if do_normalize:
+            ortho_DEM = normalize(ortho_DEM)
     else:
         ortho_DEM = None
 
@@ -622,8 +797,8 @@ def make_images(craters, lat, lon, box_size, dim, DEM, IR, ring_size, project=Tr
 
 
 def gen_dataset(
-    DEM,
-    IR,
+        DEM, DEM_src, 
+        IR, IR_src, 
     craters,
     series_prefix,
     start_index,
@@ -702,7 +877,7 @@ def gen_dataset(
         ortho_DEM, ortho_IR, ortho_mask, craters_xy = make_images(craters, lat,
                                                                   lon,
                                                                   box_size,
-                                                                  dim, DEM, IR,
+                                                                  dim, DEM, DEM_src, IR, IR_src, 
                                                                   ring_size,
                                                                   project=project)
 
