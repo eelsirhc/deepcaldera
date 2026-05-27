@@ -6,7 +6,9 @@ rad_thresh_ = 0.25
 template_thresh_ = 0.475
 target_thresh_ = 0.3
 
-root_dir = "/mnt/export/lee/1-Projects/deepcaldera"
+import pathlib
+
+root_dir = str(pathlib.Path(__file__).parents[1])# "/mnt/export/lee/1-Projects/deepcaldera"
 #DEM_filename = root_dir + "/data/raw/Mars_HRSC_MOLA_BlendDEM_Global_200mp_v2.tif"
 #IR_filename = root_dir + "/data/raw/Mars_THEMIS_scaled.tif"
 #crater_filename = root_dir + "/data/raw/RobbinsCraters_20121016.tsv"
