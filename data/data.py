@@ -90,6 +90,7 @@ from rasterio.warp import reproject, Resampling, calculate_default_transform, tr
 from rasterio.errors import WindowError
 from rasterio.crs import CRS
 
+RESAMPLING_METHOD = Resampling.nearest
 def fast_reproject_plate(src, lat_0, lon_0, box_size, img=None, dim=256):
     # Define coordinate systems
     latlong = "EPSG:4326"
@@ -174,29 +175,35 @@ def fast_reproject_merc(src, lat_0, lon_0, box_size, img=None, dim=256):
     # Define output bounds and transform
     new_left, new_bottom = centre[0] - width / 2, bottom[1]
     new_right, new_top = centre[0] + width / 2, top[1]
-
-    # Reproject destination bounds from ORTHO to EPSG:3395 (source CRS)
-    ortho_to_merc = Transformer.from_crs(orthographic, "EPSG:3395", always_xy=True)
-    src_bounds = ortho_to_merc.transform_bounds(new_left, new_bottom, new_right, new_top, densify_pts=10)
-    
-    # Get pixel bounds in source image
-    row_start, col_start = rowcol(src.transform, src_bounds[0], src_bounds[3])  # top-left
-    row_stop, col_stop = rowcol(src.transform, src_bounds[2], src_bounds[1])   # bottom-right
-    
-    # Make sure indices are valid
-    row_start, row_stop = sorted((max(0, row_start), min(img.shape[0], row_stop)))
-    col_start, col_stop = sorted((max(0, col_start), min(img.shape[1], col_stop)))
-    
-    # Crop the image more accurately
-    d = img[row_start:row_stop, col_start:col_stop]
-    window = Window(col_start, row_start, col_stop - col_start, row_stop - row_start)
-    src_transform_cropped = window_transform(window, src.transform)
-
     dst_transform = from_bounds(new_left, new_bottom, new_right, new_top, dim, dim)
-
+    
     # Reproject
     dst_data = np.empty((dim, dim), dtype=img.dtype)
+    
+    if src.crs.to_string()=="EPSG:3395": #Mercator
+        # Reproject destination bounds from ORTHO to EPSG:3395 (source CRS)
+        ortho_to_merc = Transformer.from_crs(orthographic, "EPSG:3395", always_xy=True)
+        src_bounds = ortho_to_merc.transform_bounds(new_left, new_bottom, new_right, new_top, densify_pts=10)
+    
+        # Get pixel bounds in source image
+        row_start, col_start = rowcol(src.transform, src_bounds[0], src_bounds[3])  # top-left
+        row_stop, col_stop = rowcol(src.transform, src_bounds[2], src_bounds[1])   # bottom-right
+    
+        # Make sure indices are valid
+        row_start, row_stop = sorted((max(0, row_start), min(img.shape[0], row_stop)))
+        col_start, col_stop = sorted((max(0, col_start), min(img.shape[1], col_stop)))
+    
+        # Crop the image more accurately
+        print(row_start, row_stop, col_start, col_stop, img.shape)
+        d = img[row_start:row_stop, col_start:col_stop]
+        window = Window(col_start, row_start, col_stop - col_start, row_stop - row_start)
+        src_transform_cropped = window_transform(window, src.transform)
 
+
+    elif src.crs.to_string()=="EPSG:4236" : #Plate-Caree!
+        d = img
+        src_transform_cropped = src.transform
+        
     try:
         reproject(
             source=d,
@@ -205,7 +212,7 @@ def fast_reproject_merc(src, lat_0, lon_0, box_size, img=None, dim=256):
             src_crs=src.crs,
             dst_transform=dst_transform,
             dst_crs=orthographic,
-            resampling=Resampling.nearest
+            resampling=RESAMPLING_METHOD
         )
     except:
         reproject(
@@ -215,7 +222,7 @@ def fast_reproject_merc(src, lat_0, lon_0, box_size, img=None, dim=256):
             src_crs=src.crs,
             dst_transform=dst_transform,
             dst_crs=orthographic,
-            resampling=Resampling.nearest
+            resampling=RESAMPLING_METHOD
         )
 
     if dst_data.min()==dst_data.max():
@@ -427,7 +434,7 @@ def fill_ortho_grid(lat_0, lon_0, box_size, img, src, dim=256):
         src_crs=src_crs,
         dst_transform=dst_transform,
         dst_crs=dst_crs,
-        resampling=Resampling.nearest  # or another resampling method as needed
+        resampling=RESAMPLING_METHOD  # or another resampling method as needed
     )
     return pp[0], True
 
@@ -1086,6 +1093,7 @@ def gen_dataset(
         
         else:
             raise ValueError('Mode must be either random or systematic')
+
         #print(lat, lon, box_size)
         ortho_DEM, ortho_IR, ortho_mask, craters_xy, dem_avail, ir_avail  = make_images(craters, lat,
                                                                   lon,
