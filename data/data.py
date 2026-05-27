@@ -84,10 +84,71 @@ from rasterio.transform import from_bounds
 from rasterio.warp import reproject, Resampling
 from rasterio.windows import Window
 from pyproj import Transformer
-from rasterio.windows import Window, transform as window_transform
+from rasterio.windows import Window, transform as window_transform, from_bounds as window_from_bounds
 from rasterio.transform import rowcol
+from rasterio.warp import reproject, Resampling, calculate_default_transform, transform_bounds
+from rasterio.errors import WindowError
+from rasterio.crs import CRS
 
-def fast_reproject(lat_0, lon_0, box_size, img, src, dim=256):
+def fast_reproject_plate(src, lat_0, lon_0, box_size, img=None, dim=256):
+    # Define coordinate systems
+    latlong = "EPSG:4326"
+    orthographic = dict(proj="ortho", lat_0=lat_0, lon_0=lon_0)
+
+    # Use pyproj for faster coordinate transforms
+    transformer = Transformer.from_crs(latlong, orthographic, always_xy=True)
+    coords = [
+        (lon_0, lat_0),
+        (lon_0, lat_0 + box_size / 2),
+        (lon_0, lat_0 - box_size / 2)
+    ]
+    nxs, nys = transformer.transform(*zip(*coords))
+    centre = (nxs[0], nys[0])
+    top = (nxs[1], nys[1])
+    bottom = (nxs[2], nys[2])
+    width = top[1] - bottom[1]
+
+    if img is None:
+        print("Not implemented: fast_reproject_plate without img argument")
+        # Short circuit for missing data
+        return None, False
+    # Define output bounds and transform
+    new_left, new_bottom = centre[0] - width / 2, bottom[1]
+    new_right, new_top = centre[0] + width / 2, top[1]
+
+    dst_transform = from_bounds(new_left, new_bottom, new_right, new_top, dim, dim)
+
+    # Reproject
+    dst_data = np.empty((dim, dim), dtype=img.dtype)
+
+    try:
+        reproject(
+            source=d,
+            destination=dst_data,
+            src_transform=src_transform_cropped,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=orthographic,
+            resampling=Resampling.nearest
+        )
+    except:
+        reproject(
+            source=img,
+            destination=dst_data,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=dst_transform,
+            dst_crs=orthographic,
+            resampling=Resampling.nearest
+        )
+
+    if dst_data.min()==dst_data.max():
+        print("AFTER TRANSFORM: ",dst_data.min(),dst_data.max())
+        return None, False
+    
+    return dst_data, True
+
+def fast_reproject_merc(src, lat_0, lon_0, box_size, img=None, dim=256):
     # Define coordinate systems
     mercator = "EPSG:3395"
     latlong = "EPSG:4326"
@@ -106,6 +167,10 @@ def fast_reproject(lat_0, lon_0, box_size, img, src, dim=256):
     bottom = (nxs[2], nys[2])
     width = top[1] - bottom[1]
 
+    if img is None:
+        print("Not implemented: fast_reproject_merc without img argument")
+        # Short circuit for missing data
+        return None, False
     # Define output bounds and transform
     new_left, new_bottom = centre[0] - width / 2, bottom[1]
     new_right, new_top = centre[0] + width / 2, top[1]
@@ -153,7 +218,121 @@ def fast_reproject(lat_0, lon_0, box_size, img, src, dim=256):
             resampling=Resampling.nearest
         )
 
+    if dst_data.min()==dst_data.max():
+        print("AFTER TRANSFORM: ",dst_data.min(),dst_data.max())
+        return None, False
+    
+    return dst_data, True
 
+def load_window(src, lon_min, lat_min, lon_max, lat_max):
+    # --- 1. Transform your lat/lon bbox into the raster's CRS ---
+    src_bounds = transform_bounds(
+        "EPSG:4326", src.crs,
+        lon_min, lat_min, lon_max, lat_max
+    )
+
+    # --- 2. Check intersection with raster bounds BEFORE reading ---
+    raster_bounds = src.bounds  # (left, bottom, right, top) in src CRS
+
+    if (src_bounds[0] >= raster_bounds.right  or   # requested left  >= raster right
+        src_bounds[2] <= raster_bounds.left    or   # requested right <= raster left
+        src_bounds[1] >= raster_bounds.top     or   # requested bottom >= raster top
+        src_bounds[3] <= raster_bounds.bottom):     # requested top   <= raster bottom
+        raise ValueError(f"Requested bbox {src_bounds} does not intersect raster {raster_bounds}")
+
+    # --- 3. Compute window, catching any floating point edge cases ---
+    try:
+        window = window_from_bounds(*src_bounds, transform=src.transform)
+        window = window.intersection(
+            Window(0, 0, src.width, src.height)  # clamp to valid pixels
+        )
+    except WindowError as e:
+        raise ValueError(f"Bounds are adjacent to but don't overlap the raster: {e}")
+
+    return window
+
+
+def fast_reproject_cyl(src, centre_lat, centre_lon, binsize, img=None, dim=256, test=False, debug=False):
+    # --- 1. Define your AOI in lat/lon ---
+    #print(centre_lat)
+    lon_min, lon_max = centre_lon - binsize / 2, centre_lon + binsize / 2
+    lat_min, lat_max =  centre_lat - binsize / 2, centre_lat + binsize / 2
+
+    # --- 2. Open the source (cylindrical) raster ---
+    if True: # I have it loaded already for now
+        src_crs = src.crs
+
+        # --- 3. Get the window from lat/lon bounds ---
+        # Convert lat/lon bounds to the source CRS (cylindrical coords)
+        src_bounds = transform_bounds("EPSG:4326", src_crs, lon_min, lat_min, lon_max, lat_max)
+
+        #Check if the bounds are valid
+        #print("WINDOW", lon_min, lat_min, lon_max, lat_max)
+        try:
+            window = load_window(src, lon_min, lat_min, lon_max, lat_max)
+        except ValueError as e:
+            print(f"Error occurred while loading window: {e}")
+            return None, False
+        if window is None:
+            print("WINDOW IS NONE?", lon_min, lat_min, lon_max, lat_max)
+            return None,False
+        # Get the window covering those bounds
+        window = window_from_bounds(*src_bounds, transform=src.transform)
+
+        # Clamp to valid pixel range (safety against floating point overshoot)
+        window = window.intersection(
+            Window(0, 0, src.width, src.height)
+        )
+
+        # --- 4. Read the windowed data + get its transform ---
+        data = src.read(window=window)                    # shape: (bands, rows, cols)
+        win_transform = src.window_transform(window)      # <-- correct origin for this window
+        
+        if data.min()==data.max():
+            #print("BEFORE TRANSFORM: ",data.min(),data.max())
+            return None,False
+        if test:
+            fr = np.mean(data>1e9)
+            if fr > 0.8:
+                return None,False
+            #print(fr, data.min(), data.max())
+            return None, True #don't project, just sample.
+        
+    ortho_crs = CRS.from_proj4(
+        f"+proj=ortho +lat_0={centre_lat} +lon_0={centre_lon} +datum=WGS84 +units=m"
+    )
+
+    # --- 6. Calculate the output transform for the desired image dimensions ---
+    out_width, out_height = dim,dim
+    dst_transform, dst_width, dst_height = calculate_default_transform(
+        src_crs,
+        ortho_crs,
+        data.shape[2],          # source cols (from window)
+        data.shape[1],          # source rows (from window)
+        *src_bounds,
+        dst_width=out_width,    # force your desired output size
+        dst_height=out_height,
+    )
+
+    # --- 7. Reproject ---
+    dst_data = np.zeros((dst_height, dst_width), dtype=data.dtype)
+
+    reproject(
+        source=data,
+        destination=dst_data,
+        src_transform=win_transform,    # <-- use window_transform, not src.transform
+        src_crs=src_crs,
+        dst_transform=dst_transform,
+        dst_crs=ortho_crs,
+        resampling=Resampling.bilinear,
+#        src_nodata=src.nodata,
+#        dst_nodata=src.nodata
+    )
+    if dst_data.min()==dst_data.max():
+        return None,False
+    if debug:
+        return dict(source=data, dest=dst_data)
+    #print(dst_data.shape)
     return dst_data, True
 
 def fill_ortho_grid(lat_0, lon_0, box_size, img, src, dim=256):
@@ -487,6 +666,7 @@ def remove_missing_data(array,limit=8192):
     y=np.arange(array.shape[1])
     xx, yy = np.meshgrid(x, y)
     #get only the valid values
+    #print(x.shape, y.shape, xx.shape, yy.shape, array.shape)
     x1 = xx[~array.mask]
     y1 = yy[~array.mask]
     newarr = array[~array.mask]
@@ -762,24 +942,50 @@ def systematic_pass(box_sizes, min_lat=-90, max_lat=90, min_long=-180, max_long=
             
 
 def make_images(craters, lat, lon, box_size, dim, DEM, DEM_src, IR, IR_src, ring_size, project=True):
-    craters_in_img = get_craters_in_img(craters, lat, lon, box_size, dim=dim,project=project)
+    #craters_in_img = get_craters_in_img(craters, lat, lon, box_size, dim=dim,project=project)
     
-    ortho_mask = make_mask(craters_in_img, ring_size, dim=dim)
-    ortho_mask = normalize(ortho_mask)
+    #ortho_mask = make_mask(craters_in_img, ring_size, dim=dim)
+    #ortho_mask = normalize(ortho_mask)
+    craters_in_img = None
+    ortho_mask = None
     if IR is not None:
         if project:
             ortho_IR = fill_ortho_grid(lat, lon, box_size, IR, IR_src)
         else:
             ortho_IR = fill_grid(lat, lon, box_size, IR)
+            ir_avail = True
         ortho_IR = normalize(ortho_IR)
+        
     else:
         ortho_IR = None
+        ir_avail = False
     
-    if DEM is not None:
+    if not (DEM is None and DEM_src is None):
         do_normalize=True
+        #print("MAKING DEM")
         if project:
+        #    print("PROJECTING DEM")
             try:
-                ortho_DEM,_do_normalize = fast_reproject(lat, lon, box_size, DEM, DEM_src) #
+                if DEM_src.crs.to_string() == 'EPSG:4326':
+        #            print("REPROJECTING DEM WITH PLATE PROJECTION")
+                    ortho_DEM,_do_normalize = fast_reproject_plate(DEM_src, lat, lon, box_size, img=DEM) #
+                    dem_avail=True
+                elif DEM_src.crs.to_string() == 'EPSG:3395':
+        #            print("REPROJECTING DEM WITH MERCATOR PROJECTION")
+                    ortho_DEM,_do_normalize = fast_reproject_merc(DEM_src, lat, lon, box_size, img=DEM) #
+                    dem_avail=True
+                elif DEM_src.crs.to_string() == 'ESRI:54034':
+        #            print("REPROJECTING DEM WITH EQUAL AREA PROJECTION")
+        #            print(lat, lon, box_size)
+                    ortho_DEM,_do_normalize = fast_reproject_cyl(DEM_src, lat, lon, box_size, img=DEM) #
+                    if ortho_DEM is None:
+                        dem_avail=False
+                    else:
+                        dem_avail=True
+        #        else:
+        #            print("UNKNOWN PROJECTION:", DEM_src.crs.to_string(),
+        #                  DEM_src.crs.to_string() == 'ESRI:54034',
+        #                  DEM_src.crs.to_string() == 'EPSG:3395')
             except:
                 raise
 #            ortho_DEM, _do_normalize = fill_ortho_grid(lat, lon, box_size, DEM, DEM_src)
@@ -787,12 +993,14 @@ def make_images(craters, lat, lon, box_size, dim, DEM, DEM_src, IR, IR_src, ring
 #            sys.exit(0)
         else:
             ortho_DEM = fill_grid(lat, lon, box_size, DEM)
-        if do_normalize:
+            dem_avail = True
+        if do_normalize and ortho_DEM is not None:
             ortho_DEM = normalize(ortho_DEM)
     else:
         ortho_DEM = None
+        dem_avail=False
 
-    return ortho_DEM, ortho_IR, ortho_mask, craters_in_img
+    return ortho_DEM, ortho_IR, ortho_mask, craters_in_img, dem_avail, ir_avail
         
 
 
@@ -814,24 +1022,28 @@ def gen_dataset(
     max_lat=90,
     min_long=-180,
     max_long=180,
-    project=True
+    project=True,
+    root_dir = None
 ):
-    
+
+    if root_dir is None:
+        root_dir=cfg.root_dir
+        
     # Create HDF5 files
     imgs_filename = '{}/data/processed/{}_images_{:05d}.hdf5'.format(
-            cfg.root_dir, series_prefix, start_index)
+            root_dir, series_prefix, start_index)
     imgs_h5 = h5py.File(imgs_filename, 'w')
     imgs_h5_DEM = imgs_h5.create_dataset('input_DEM',
                                          (amount, dim, dim),
-                                         dtype='float32')
+                                         dtype='float32', compression="gzip")
     imgs_h5_DEM.attrs['definition'] = 'Input DEM dataset.'
     imgs_h5_IR = imgs_h5.create_dataset('input_IR',
                                         (amount, dim, dim),
-                                        dtype='float32')
+                                        dtype='float32', compression="gzip")
     imgs_h5_IR.attrs['definition'] = 'Input IR dataset.'
     imgs_h5_targets = imgs_h5.create_dataset('target_masks',
                                              (amount, dim, dim),
-                                             dtype='float32')
+                                             dtype='float32', compression="gzip")
     imgs_h5_targets.attrs['definition'] = 'Target mask dataset.'
     imgs_h5_cll = imgs_h5.create_dataset('central_lat_lon',
                                          (amount, 2),
@@ -843,14 +1055,15 @@ def gen_dataset(
     imgs_h5_box_size.attrs['definition'] = 'Box size'
     
     craters_filename = '{}/data/processed/{}_craters_{:05d}.hdf5'.format(
-            cfg.root_dir, series_prefix, start_index)
+            root_dir, series_prefix, start_index)
     craters_h5 = pd.HDFStore(craters_filename)
 
     if in_notebook:
         tqdm_type = tqdm_notebook
     else:
         tqdm_type = tqdm
-    
+    hasdata_dem=0
+    hasdata_ir=0
     for i in tqdm_type(range(amount)):
         if mode=='random':
             lat = np.random.uniform(min_lat, max_lat)
@@ -867,25 +1080,28 @@ def gen_dataset(
                 imgs_h5.close()
                 craters_h5.close()
                 print('\nNo more images', flush=True)
-                return
+                return 0,0
             else:
                 lat, lon, box_size = sys_pass[start_index + i]
         
         else:
             raise ValueError('Mode must be either random or systematic')
         #print(lat, lon, box_size)
-        ortho_DEM, ortho_IR, ortho_mask, craters_xy = make_images(craters, lat,
+        ortho_DEM, ortho_IR, ortho_mask, craters_xy, dem_avail, ir_avail  = make_images(craters, lat,
                                                                   lon,
                                                                   box_size,
                                                                   dim, DEM, DEM_src, IR, IR_src, 
                                                                   ring_size,
                                                                   project=project)
 
-        if DEM is not None:
+        if dem_avail:
             imgs_h5_DEM[i, ...] = ortho_DEM
-        if IR is not None:
+            hasdata_dem+=1
+        if ir_avail:
             imgs_h5_IR[i, ...] = ortho_IR
-        imgs_h5_targets[i, ...] = ortho_mask
+            hasdata_ir+=1
+        if ortho_mask!=None:
+            imgs_h5_targets[i, ...] = ortho_mask
         imgs_h5_cll[i, 0] = lat
         imgs_h5_cll[i, 1] = lon
         imgs_h5_box_size[i, 0] = box_size
@@ -896,7 +1112,7 @@ def gen_dataset(
         craters_h5.flush()
     imgs_h5.close()
     craters_h5.close()
-
+    return hasdata_dem, hasdata_ir
 
 def main():
 
