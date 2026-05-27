@@ -70,6 +70,8 @@ def template_match_t(target_original):
     radii = np.arange(cfg.minrad_, cfg.maxrad_ + 1, 1, dtype=int)
     coords = []     # coordinates extracted from template matching
     corr = []       # correlation coefficient for coordinates set
+    if target_original.min() == target_original.max():
+        return coords
     for r in radii:
         # template
         n = 2 * (r + rw + 1)
